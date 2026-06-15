@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Day 13 Observability Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 16px; }
+  h1 { font-size: 1.2rem; margin-bottom: 4px; color: #f8fafc; }
+  .subtitle { font-size: 0.75rem; color: #64748b; margin-bottom: 16px; }
+  .status-bar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .badge { padding: 4px 10px; border-radius: 99px; font-size: 0.7rem; font-weight: 600; }
+  .badge.ok { background: #14532d; color: #4ade80; }
+  .badge.warn { background: #451a03; color: #fb923c; }
+  .badge.err { background: #450a0a; color: #f87171; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .panel { background: #1e2433; border-radius: 8px; padding: 14px; border: 1px solid #2d3748; }
+  .panel h2 { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .panel .big { font-size: 2rem; font-weight: 700; color: #f8fafc; }
+  .panel .unit { font-size: 0.7rem; color: #64748b; margin-left: 4px; }
+  .panel .slo { font-size: 0.68rem; color: #64748b; margin-top: 4px; }
+  .panel .slo .ok { color: #4ade80; }
+  .panel .slo .warn { color: #fb923c; }
+  canvas { margin-top: 10px; max-height: 120px; }
+  #refresh-info { font-size: 0.68rem; color: #475569; margin-top: 12px; text-align: right; }
+</style>
+</head>
+<body>
+<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;">
+  <div>
+    <h1>Day 13 Observability Dashboard</h1>
+    <p class="subtitle">Auto-refresh every 15s &nbsp;|&nbsp; SLO window: 28d &nbsp;|&nbsp; Service: day13-observability-lab</p>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <span id="refresh-info" style="font-size:0.68rem;color:#475569;">Last updated: —</span>
+    <button onclick="refresh()" style="padding:5px 14px;font-size:0.75rem;background:#2d3748;color:#e2e8f0;border:1px solid #4a5568;border-radius:6px;cursor:pointer;">↻ Refresh</button>
+  </div>
+</div>
+<div class="status-bar" id="status-bar"></div>
+
+<div class="grid">
+  <!-- Panel 1: Latency -->
+  <div class="panel">
+    <h2>Latency P50 / P95 / P99</h2>
+    <div><span class="big" id="p95-val">—</span><span class="unit">ms P95</span></div>
+    <div class="slo">SLO: P95 &lt; <b>3000ms</b> &nbsp; Status: <span id="latency-slo">—</span></div>
+    <canvas id="chart-latency"></canvas>
+  </div>
+
+  <!-- Panel 2: Traffic -->
+  <div class="panel">
+    <h2>Traffic (total requests)</h2>
+    <div><span class="big" id="traffic-val">—</span><span class="unit">req</span></div>
+    <div class="slo">Samples collected since app start</div>
+    <canvas id="chart-traffic"></canvas>
+  </div>
+
+  <!-- Panel 3: Error Rate -->
+  <div class="panel">
+    <h2>Error Rate</h2>
+    <div><span class="big" id="err-val">—</span><span class="unit">%</span></div>
+    <div class="slo">SLO: &lt; <b>2%</b> &nbsp; Status: <span id="err-slo">—</span></div>
+    <canvas id="chart-err"></canvas>
+  </div>
+
+  <!-- Panel 4: Cost -->
+  <div class="panel">
+    <h2>Cost Over Time</h2>
+    <div><span class="big" id="cost-val">—</span><span class="unit">USD total</span></div>
+    <div class="slo">SLO: &lt; <b>$2.50/day</b> &nbsp; Avg/req: <span id="cost-avg">—</span></div>
+    <canvas id="chart-cost"></canvas>
+  </div>
+
+  <!-- Panel 5: Tokens -->
+  <div class="panel">
+    <h2>Tokens In / Out</h2>
+    <div><span class="big" id="tokens-in-val">—</span><span class="unit">in</span> &nbsp; <span class="big" id="tokens-out-val">—</span><span class="unit">out</span></div>
+    <div class="slo">Cumulative token usage</div>
+    <canvas id="chart-tokens"></canvas>
+  </div>
+
+  <!-- Panel 6: Quality -->
+  <div class="panel">
+    <h2>Quality Score (heuristic)</h2>
+    <div><span class="big" id="quality-val">—</span><span class="unit">avg</span></div>
+    <div class="slo">SLO: &gt; <b>0.75</b> &nbsp; Status: <span id="quality-slo">—</span></div>
+    <canvas id="chart-quality"></canvas>
+  </div>
+</div>
+
+<script>
+const API = 'http://127.0.0.1:8000/metrics';
+const HISTORY_LEN = 20;
+
+// SLO thresholds
+const SLO = { p95: 3000, errRate: 2, dailyCost: 2.5, quality: 0.75 };
+
+// History buffers
+const hist = { labels: [], p50: [], p95: [], p99: [], traffic: [], err: [], cost: [], tokIn: [], tokOut: [], quality: [] };
+let prevTraffic = 0;
+let prevErrors = 0;
+
+function makeChart(id, datasets, yMax) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: hist.labels, datasets },
+    options: {
+      animation: false,
+      plugins: { legend: { display: datasets.length > 1, labels: { color: '#94a3b8', font: { size: 10 }, boxWidth: 10 } } },
+      scales: {
+        x: { display: false },
+        y: { min: 0, max: yMax, ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: '#2d3748' } }
+      }
+    }
+  });
+}
+
+const charts = {
+  latency: makeChart('chart-latency', [
+    { label: 'P50', data: hist.p50, borderColor: '#38bdf8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+    { label: 'P95', data: hist.p95, borderColor: '#f59e0b', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+    { label: 'P99', data: hist.p99, borderColor: '#f87171', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+  ]),
+  traffic: makeChart('chart-traffic', [{ label: 'Req/poll', data: hist.traffic, borderColor: '#818cf8', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true, backgroundColor: 'rgba(129,140,248,0.1)' }]),
+  err:     makeChart('chart-err',     [{ label: 'Err%', data: hist.err, borderColor: '#f87171', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true, backgroundColor: 'rgba(248,113,113,0.1)' }], 10),
+  cost:    makeChart('chart-cost',    [{ label: 'Total USD', data: hist.cost, borderColor: '#34d399', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }]),
+  tokens:  makeChart('chart-tokens',  [
+    { label: 'In', data: hist.tokIn, borderColor: '#a78bfa', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+    { label: 'Out', data: hist.tokOut, borderColor: '#fb923c', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+  ]),
+  quality: makeChart('chart-quality', [{ label: 'Quality', data: hist.quality, borderColor: '#4ade80', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }], 1),
+};
+
+function sloSpan(ok, label) {
+  return `<span class="${ok ? 'ok' : 'warn'}">${ok ? '✓' : '✗'} ${label}</span>`;
+}
+
+function push(arr, val) {
+  arr.push(val);
+  if (arr.length > HISTORY_LEN) arr.shift();
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(API);
+    const d = await r.json();
+    const now = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    // Compute error rate
+    const totalReq = d.traffic || 0;
+    const totalErr = Object.values(d.error_breakdown || {}).reduce((a, b) => a + b, 0);
+    const errRate = totalReq > 0 ? (totalErr / totalReq) * 100 : 0;
+    const newReq = Math.max(0, totalReq - prevTraffic);
+    prevTraffic = totalReq;
+
+    // Push history
+    push(hist.labels, now);
+    push(hist.p50, d.latency_p50 || 0);
+    push(hist.p95, d.latency_p95 || 0);
+    push(hist.p99, d.latency_p99 || 0);
+    push(hist.traffic, newReq);
+    push(hist.err, errRate.toFixed(2));
+    push(hist.cost, d.total_cost_usd || 0);
+    push(hist.tokIn, d.tokens_in_total || 0);
+    push(hist.tokOut, d.tokens_out_total || 0);
+    push(hist.quality, d.quality_avg || 0);
+
+    // Update big numbers
+    document.getElementById('p95-val').textContent = Math.round(d.latency_p95 || 0);
+    document.getElementById('traffic-val').textContent = totalReq;
+    document.getElementById('err-val').textContent = errRate.toFixed(1);
+    document.getElementById('cost-val').textContent = '$' + (d.total_cost_usd || 0).toFixed(4);
+    document.getElementById('cost-avg').textContent = '$' + (d.avg_cost_usd || 0).toFixed(6) + '/req';
+    document.getElementById('tokens-in-val').textContent = (d.tokens_in_total || 0).toLocaleString();
+    document.getElementById('tokens-out-val').textContent = (d.tokens_out_total || 0).toLocaleString();
+    document.getElementById('quality-val').textContent = (d.quality_avg || 0).toFixed(2);
+
+    // SLO badges
+    document.getElementById('latency-slo').innerHTML = sloSpan(d.latency_p95 <= SLO.p95 || d.latency_p95 === 0, d.latency_p95 <= SLO.p95 ? 'OK' : 'BREACH');
+    document.getElementById('err-slo').innerHTML = sloSpan(errRate <= SLO.errRate, errRate <= SLO.errRate ? 'OK' : 'BREACH');
+    document.getElementById('quality-slo').innerHTML = sloSpan(d.quality_avg >= SLO.quality || d.quality_avg === 0, d.quality_avg >= SLO.quality ? 'OK' : 'BREACH');
+
+    // Status bar
+    const allOk = d.latency_p95 <= SLO.p95 && errRate <= SLO.errRate && d.quality_avg >= SLO.quality;
+    document.getElementById('status-bar').innerHTML = `
+      <span class="badge ${d.latency_p95 <= SLO.p95 || !d.latency_p95 ? 'ok' : 'err'}">P95 Latency</span>
+      <span class="badge ${errRate <= SLO.errRate ? 'ok' : 'err'}">Error Rate</span>
+      <span class="badge ${d.quality_avg >= SLO.quality || !d.quality_avg ? 'ok' : 'warn'}">Quality</span>
+      <span class="badge ${d.total_cost_usd < SLO.dailyCost ? 'ok' : 'warn'}">Cost</span>
+    `;
+
+    // Update charts
+    Object.values(charts).forEach(c => c.update('none'));
+    document.getElementById('refresh-info').textContent = 'Last updated: ' + now;
+  } catch (e) {
+    document.getElementById('refresh-info').textContent = 'Error fetching metrics — is app running?';
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

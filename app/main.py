@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from structlog.contextvars import bind_contextvars
 
 from .agent import LabAgent
+from .audit import audit
 from .incidents import disable, enable, status
 from .logging_config import configure_logging, get_logger
 from .metrics import record_error, snapshot
@@ -18,6 +20,7 @@ from .tracing import tracing_enabled
 configure_logging()
 log = get_logger()
 app = FastAPI(title="Day 13 Observability Lab")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(CorrelationIdMiddleware)
 agent = LabAgent()
 
@@ -44,8 +47,12 @@ async def metrics() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
-    # TODO: Enrich logs with request context (user_id_hash, session_id, feature, model, env)
-    # bind_contextvars(...)
+    bind_contextvars(
+        user_id_hash=hash_user_id(body.user_id),
+        session_id=body.session_id,
+        feature=body.feature,
+        model=body.model,
+    )
     
     log.info(
         "request_received",
@@ -68,6 +75,15 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             cost_usd=result.cost_usd,
             payload={"answer_preview": summarize_text(result.answer)},
         )
+        audit(
+            action="chat",
+            actor=hash_user_id(body.user_id),
+            outcome="success",
+            correlation_id=request.state.correlation_id,
+            feature=body.feature,
+            latency_ms=result.latency_ms,
+            cost_usd=result.cost_usd,
+        )
         return ChatResponse(
             answer=result.answer,
             correlation_id=request.state.correlation_id,
@@ -80,6 +96,14 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     except Exception as exc:  # pragma: no cover
         error_type = type(exc).__name__
         record_error(error_type)
+        audit(
+            action="chat",
+            actor=hash_user_id(body.user_id),
+            outcome="error",
+            correlation_id=request.state.correlation_id,
+            feature=body.feature,
+            error_type=error_type,
+        )
         log.error(
             "request_failed",
             service="api",
@@ -94,6 +118,7 @@ async def enable_incident(name: str) -> JSONResponse:
     try:
         enable(name)
         log.warning("incident_enabled", service="control", payload={"name": name})
+        audit(action="incident_enable", actor="operator", outcome="success", incident=name)
         return JSONResponse({"ok": True, "incidents": status()})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -104,6 +129,7 @@ async def disable_incident(name: str) -> JSONResponse:
     try:
         disable(name)
         log.warning("incident_disabled", service="control", payload={"name": name})
+        audit(action="incident_disable", actor="operator", outcome="success", incident=name)
         return JSONResponse({"ok": True, "incidents": status()})
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
